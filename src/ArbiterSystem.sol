@@ -8,22 +8,22 @@ import "./interfaces/ITrustlessDisclosure.sol";
 
 /**
  * @title ArbiterSystem
- * @notice Manages dispute resolution for TrustlessDisclosure contracts
- * @dev Implements two-phase process: eligibility then case submission
+ * @notice Manages arbitration for TrustlessDisclosure disputes with upgradeable multi-arbiter support
+ * @dev Initially single-arbiter, can be upgraded to multi-arbiter system
  */
 contract ArbiterSystem is ReentrancyGuard, Ownable {
-    /// @notice State tracking for arbitration cases
+    /// @notice Tracks the state of arbitration cases
     enum CaseState { 
         None,           // Initial state
         Eligible,       // Made eligible by paying fee
-        PendingReview,  // Case submitted, awaiting initial review
-        AwaitingTrial,  // Accepted for trial, awaiting verdict
+        PendingReview,  // Awaiting initial review
+        AwaitingTrial,  // Accepted for trial
         Declined,       // Not accepted for trial
         Accepted,       // Final positive verdict
         Rejected        // Final negative verdict
     }
     
-    /// @notice Core case information and tracking
+    /// @notice Stores case information
     struct Case {
         CaseState state;
         uint256 filingTime;
@@ -33,7 +33,7 @@ contract ArbiterSystem is ReentrancyGuard, Ownable {
         bool submissionFeePaid;
     }
 
-    /// @notice Global queue statistics and configuration
+    /// @notice Tracks queue statistics
     struct QueueInfo {
         uint256 pendingReviewCount;
         uint256 awaitingTrialCount;
@@ -41,26 +41,23 @@ contract ArbiterSystem is ReentrancyGuard, Ownable {
         uint256 nextPosition;
     }
 
-    /// @notice Constants for fee calculations
     uint256 public constant ELIGIBILITY_FEE_PERCENT = 1; // 1% of requested reward
     
-    /// @notice Core contract addresses
     IERC20 public immutable trustlessRep;
     address public immutable treasury;
 
-    /// @notice Primary state mappings
     mapping(address => Case) public cases;
     mapping(uint256 => address) public reviewQueue;
     mapping(uint256 => address) public trialQueue;
-    
-    /// @notice Fee waiver tracking
     mapping(address => bool) public hasEligibilityFeeWaiver;
     mapping(address => bool) public hasSubmissionFeeWaiver;
     
-    /// @notice Queue management
+    // Multi-arbiter system state
+    bool public isMultiArbiterEnabled;
+    mapping(address => bool) public isApprovedArbiter;
+    
     QueueInfo public queueInfo;
 
-    /// @notice Events for tracking system state
     event EligibilityAchieved(address indexed disclosure, uint256 fee);
     event CaseSubmitted(address indexed disclosure, address indexed filer);
     event CaseAcceptedForTrial(address indexed disclosure);
@@ -68,8 +65,11 @@ contract ArbiterSystem is ReentrancyGuard, Ownable {
     event CaseVerdict(address indexed disclosure, bool accepted);
     event FeeWaiverGranted(address indexed disclosure, bool isEligibilityWaiver);
     event QueueReorganized(uint256 indexed position);
+    event ArbiterSystemUpgraded(address newSystem);
+    event MultiArbiterEnabled();
+    event NewArbiterAdded(address indexed arbiter);
+    event ArbiterRemoved(address indexed arbiter);
 
-    /// @notice Custom errors for gas optimization
     error NotSignedDisclosure();
     error InvalidCaseState();
     error InsufficientFee();
@@ -78,16 +78,26 @@ contract ArbiterSystem is ReentrancyGuard, Ownable {
     error InvalidQueueOperation();
     error AlreadyEligible();
     error NotYetEligible();
+    error NotAuthorizedArbiter();
+    error MultiArbiterNotEnabled();
+    error InvalidArbiterAddress();
+    error CannotRemoveOwner();
+
+    modifier onlyArbiter() {
+        if (!(msg.sender == owner() || (isMultiArbiterEnabled && isApprovedArbiter[msg.sender]))) {
+            revert NotAuthorizedArbiter();
+        }
+        _;
+    }
 
     constructor(address _trustlessRep, address _treasury) Ownable(msg.sender) {
         trustlessRep = IERC20(_trustlessRep);
         treasury = _treasury;
-        queueInfo.baseSubmissionFee = 100 ether; // 100 TDREP base fee
+        queueInfo.baseSubmissionFee = 100 ether; // 100 TDREP
     }
 
-    /**
-     * @notice Makes a disclosure eligible for arbitration by paying fee
-     * @param disclosure Address of the disclosure contract
+    /** @notice Makes disclosure eligible for arbitration with fee
+     * @param disclosure Address of the disclosure
      */
     function makeEligible(address disclosure) external nonReentrant {
         Case storage caseData = cases[disclosure];
@@ -98,7 +108,6 @@ contract ArbiterSystem is ReentrancyGuard, Ownable {
             revert NotSignedDisclosure();
         }
         
-        // Calculate and collect eligibility fee if not waived
         if (!hasEligibilityFeeWaiver[disclosure]) {
             uint256 fee = (disc.requestedReward() * ELIGIBILITY_FEE_PERCENT) / 100;
             bool success = trustlessRep.transferFrom(msg.sender, treasury, fee);
@@ -110,19 +119,17 @@ contract ArbiterSystem is ReentrancyGuard, Ownable {
         caseData.state = CaseState.Eligible;
     }
 
-    /**
-     * @notice Calculates current submission fee based on queue size
-     * @return fee Current required submission fee
+    /** @notice Calculates submission fee based on queue size
+     * @return Current required submission fee
      */
-    function calculateCurrentFee() public view returns (uint256 fee) {
+    function calculateCurrentFee() public view returns (uint256) {
         if (queueInfo.pendingReviewCount == 0) return queueInfo.baseSubmissionFee;
         return queueInfo.baseSubmissionFee * (2 ** queueInfo.pendingReviewCount);
     }
 
-    /**
-     * @notice Grants fee waiver for either eligibility or submission
-     * @param disclosure Address of the disclosure contract
-     * @param isEligibilityWaiver True for eligibility fee waiver, false for submission fee
+    /** @notice Waives fees for eligible cases
+     * @param disclosure Address of disclosure
+     * @param isEligibilityWaiver True for eligibility fee, false for submission
      */
     function grantFeeWaiver(address disclosure, bool isEligibilityWaiver) external onlyOwner {
         if (isEligibilityWaiver) {
@@ -133,15 +140,13 @@ contract ArbiterSystem is ReentrancyGuard, Ownable {
         emit FeeWaiverGranted(disclosure, isEligibilityWaiver);
     }
 
-    /**
-     * @notice Submits an eligible case for arbitration
-     * @param disclosure Address of the disclosure contract
+    /** @notice Submits case for arbitration
+     * @param disclosure Address of disclosure
      */
     function submitCase(address disclosure) external nonReentrant {
         Case storage caseData = cases[disclosure];
         if (caseData.state != CaseState.Eligible) revert NotYetEligible();
         
-        // Handle submission fee unless waived
         if (!hasSubmissionFeeWaiver[disclosure]) {
             uint256 fee = calculateCurrentFee();
             bool success = trustlessRep.transferFrom(msg.sender, treasury, fee);
@@ -149,7 +154,6 @@ contract ArbiterSystem is ReentrancyGuard, Ownable {
             caseData.submissionFeePaid = true;
         }
 
-        // Add to review queue
         uint256 position = queueInfo.nextPosition++;
         reviewQueue[position] = disclosure;
         queueInfo.pendingReviewCount++;
@@ -162,14 +166,13 @@ contract ArbiterSystem is ReentrancyGuard, Ownable {
         emit CaseSubmitted(disclosure, msg.sender);
     }
 
-    /**
-     * @notice Reviews a case and decides whether to accept for trial
-     * @param disclosure Address of the disclosure contract
-     * @param acceptForTrial Whether to accept the case for trial
+    /** @notice Reviews case for trial acceptance
+     * @param disclosure Address of disclosure
+     * @param acceptForTrial Whether to accept for trial
      */
     function reviewCase(address disclosure, bool acceptForTrial) 
         external 
-        onlyOwner 
+        onlyArbiter 
     {
         Case storage caseData = cases[disclosure];
         if (caseData.state != CaseState.PendingReview) revert InvalidCaseState();
@@ -183,19 +186,17 @@ contract ArbiterSystem is ReentrancyGuard, Ownable {
             emit CaseDeclined(disclosure);
         }
 
-        // Remove from review queue
         _reorganizeQueue(caseData.queuePosition);
         queueInfo.pendingReviewCount--;
     }
 
-    /**
-     * @notice Makes final verdict on a case
-     * @param disclosure Address of the disclosure contract
-     * @param accepted Whether the case is accepted or rejected
+    /** @notice Makes final verdict on case
+     * @param disclosure Address of disclosure
+     * @param accepted Whether case is accepted
      */
     function makeVerdict(address disclosure, bool accepted)
         external
-        onlyOwner
+        onlyArbiter
     {
         Case storage caseData = cases[disclosure];
         if (caseData.state != CaseState.AwaitingTrial) revert InvalidCaseState();
@@ -206,9 +207,43 @@ contract ArbiterSystem is ReentrancyGuard, Ownable {
         emit CaseVerdict(disclosure, accepted);
     }
 
-    /**
-     * @notice Internal function to reorganize queue after removal
-     * @param position Position to remove from queue
+    /** @notice Enables multi-arbiter functionality */
+    function upgradeToMultiArbiter() external onlyOwner {
+        isMultiArbiterEnabled = true;
+        isApprovedArbiter[owner()] = true;
+        emit MultiArbiterEnabled();
+    }
+
+    /** @notice Upgrades to new arbiter system
+     * @param newSystem Address of new system
+     */
+    function upgradeArbiterSystem(address newSystem) external onlyOwner {
+        if (newSystem == address(0)) revert InvalidArbiterAddress();
+        emit ArbiterSystemUpgraded(newSystem);
+    }
+
+    /** @notice Adds new arbiter after upgrade
+     * @param arbiter Address of new arbiter
+     */
+    function addArbiter(address arbiter) external onlyOwner {
+        if (!isMultiArbiterEnabled) revert MultiArbiterNotEnabled();
+        if (arbiter == address(0)) revert InvalidArbiterAddress();
+        isApprovedArbiter[arbiter] = true;
+        emit NewArbiterAdded(arbiter);
+    }
+
+    /** @notice Removes arbiter from system
+     * @param arbiter Address to remove
+     */
+    function removeArbiter(address arbiter) external onlyOwner {
+        if (!isMultiArbiterEnabled) revert MultiArbiterNotEnabled();
+        if (arbiter == owner()) revert CannotRemoveOwner();
+        isApprovedArbiter[arbiter] = false;
+        emit ArbiterRemoved(arbiter);
+    }
+
+    /** @notice Reorganizes queue after case removal
+     * @param position Position to remove
      */
     function _reorganizeQueue(uint256 position) internal {
         for (uint256 i = position; i < queueInfo.nextPosition - 1; i++) {
@@ -223,15 +258,9 @@ contract ArbiterSystem is ReentrancyGuard, Ownable {
         emit QueueReorganized(position);
     }
 
-    /**
-     * @notice Returns full case details including queue position
-     * @param disclosure Address of the disclosure contract
-     * @return state Current case state
-     * @return filingTime Time case was filed
-     * @return filer Address that filed the case
-     * @return queuePosition Current position in queue (if applicable)
-     * @return eligibilityFeePaid Whether eligibility fee was paid
-     * @return submissionFeePaid Whether submission fee was paid
+    /** @notice Gets complete case details
+     * @param disclosure Address of disclosure
+     * @return Full case information
      */
     function getCaseDetails(address disclosure) 
         external 
