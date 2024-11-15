@@ -8,146 +8,251 @@ import "./interfaces/ITrustlessDisclosure.sol";
 
 /**
  * @title ArbiterSystem
- * @notice Initial implementation with single arbiter, designed for future expansion
- * @dev Currently owner-only arbitration, prepared for future multi-arbiter system
+ * @notice Manages dispute resolution for TrustlessDisclosure contracts
+ * @dev Implements two-phase process: eligibility then case submission
  */
 contract ArbiterSystem is ReentrancyGuard, Ownable {
-    IERC20 public immutable trustlessRep;
-    address public immutable treasury;
+    /// @notice State tracking for arbitration cases
+    enum CaseState { 
+        None,           // Initial state
+        Eligible,       // Made eligible by paying fee
+        PendingReview,  // Case submitted, awaiting initial review
+        AwaitingTrial,  // Accepted for trial, awaiting verdict
+        Declined,       // Not accepted for trial
+        Accepted,       // Final positive verdict
+        Rejected        // Final negative verdict
+    }
     
-    enum CaseState { None, Pending, Accepted, Declined }
-    
+    /// @notice Core case information and tracking
     struct Case {
         CaseState state;
         uint256 filingTime;
         address filer;
-        bool feePaid;
+        uint256 queuePosition;
+        bool eligibilityFeePaid;
+        bool submissionFeePaid;
     }
-    
-    struct QueueInfo {
-        uint256 pendingCases;
-        uint256 baseFee;
-        mapping(uint256 => address) caseQueue; // position => disclosure
-        mapping(address => bool) hasFeeWaiver;
-    }
-    
-    QueueInfo public queue;
-    uint256 public constant BASE_CASE_FEE = 100 ether; // Base fee in TDREP
 
-    // Disclosure => Case details
+    /// @notice Global queue statistics and configuration
+    struct QueueInfo {
+        uint256 pendingReviewCount;
+        uint256 awaitingTrialCount;
+        uint256 baseSubmissionFee;
+        uint256 nextPosition;
+    }
+
+    /// @notice Constants for fee calculations
+    uint256 public constant ELIGIBILITY_FEE_PERCENT = 1; // 1% of requested reward
+    
+    /// @notice Core contract addresses
+    IERC20 public immutable trustlessRep;
+    address public immutable treasury;
+
+    /// @notice Primary state mappings
     mapping(address => Case) public cases;
+    mapping(uint256 => address) public reviewQueue;
+    mapping(uint256 => address) public trialQueue;
     
-    uint256 public constant CASE_FILING_FEE = 100 ether; // 100 TDREP
-    uint256 public constant ELIGIBILITY_FEE_PERCENT = 1; // 1% of requestedReward
-    uint256 public constant COOLING_PERIOD = 3 days;
+    /// @notice Fee waiver tracking
+    mapping(address => bool) public hasEligibilityFeeWaiver;
+    mapping(address => bool) public hasSubmissionFeeWaiver;
     
-    event EligibilityAchieved(address disclosure);
-    event CaseFiled(address disclosure, address filer);
-    event CaseAccepted(address disclosure);
-    event CaseDeclined(address disclosure);
-    
-    // Events for future multi-arbiter system
-    event ArbiterSystemUpgraded(address newSystem);
-    event MultiArbiterEnabled();
-    
-    error NotEligible();
-    error CaseAlreadyExists();
+    /// @notice Queue management
+    QueueInfo public queueInfo;
+
+    /// @notice Events for tracking system state
+    event EligibilityAchieved(address indexed disclosure, uint256 fee);
+    event CaseSubmitted(address indexed disclosure, address indexed filer);
+    event CaseAcceptedForTrial(address indexed disclosure);
+    event CaseDeclined(address indexed disclosure);
+    event CaseVerdict(address indexed disclosure, bool accepted);
+    event FeeWaiverGranted(address indexed disclosure, bool isEligibilityWaiver);
+    event QueueReorganized(uint256 indexed position);
+
+    /// @notice Custom errors for gas optimization
+    error NotSignedDisclosure();
     error InvalidCaseState();
-    error CoolingPeriodActive();
-    error NotAuthorized();
+    error InsufficientFee();
     error TransferFailed();
+    error NotInQueue();
+    error InvalidQueueOperation();
+    error AlreadyEligible();
+    error NotYetEligible();
 
     constructor(address _trustlessRep, address _treasury) Ownable(msg.sender) {
         trustlessRep = IERC20(_trustlessRep);
         treasury = _treasury;
+        queueInfo.baseSubmissionFee = 100 ether; // 100 TDREP base fee
     }
 
     /**
-     * @notice Makes a disclosure eligible for arbitration
+     * @notice Makes a disclosure eligible for arbitration by paying fee
      * @param disclosure Address of the disclosure contract
      */
     function makeEligible(address disclosure) external nonReentrant {
         Case storage caseData = cases[disclosure];
-        if (caseData.state != CaseState.None) revert CaseAlreadyExists();
+        if (caseData.state != CaseState.None) revert AlreadyEligible();
         
         ITrustlessDisclosure disc = ITrustlessDisclosure(disclosure);
-        require(disc.state() == ITrustlessDisclosure.State.Signed, "Not signed");
+        if (disc.state() != ITrustlessDisclosure.State.Signed) {
+            revert NotSignedDisclosure();
+        }
         
-        uint256 fee = (disc.requestedReward() * ELIGIBILITY_FEE_PERCENT) / 100;
-        bool success = trustlessRep.transferFrom(msg.sender, treasury, fee);
-        if (!success) revert TransferFailed();
+        // Calculate and collect eligibility fee if not waived
+        if (!hasEligibilityFeeWaiver[disclosure]) {
+            uint256 fee = (disc.requestedReward() * ELIGIBILITY_FEE_PERCENT) / 100;
+            bool success = trustlessRep.transferFrom(msg.sender, treasury, fee);
+            if (!success) revert TransferFailed();
+            caseData.eligibilityFeePaid = true;
+            emit EligibilityAchieved(disclosure, fee);
+        }
         
-        caseData.feePaid = true;
-        emit EligibilityAchieved(disclosure);
+        caseData.state = CaseState.Eligible;
     }
 
     /**
-     * @notice Files a case for arbitration
+     * @notice Calculates current submission fee based on queue size
+     * @return fee Current required submission fee
+     */
+    function calculateCurrentFee() public view returns (uint256 fee) {
+        if (queueInfo.pendingReviewCount == 0) return queueInfo.baseSubmissionFee;
+        return queueInfo.baseSubmissionFee * (2 ** queueInfo.pendingReviewCount);
+    }
+
+    /**
+     * @notice Grants fee waiver for either eligibility or submission
+     * @param disclosure Address of the disclosure contract
+     * @param isEligibilityWaiver True for eligibility fee waiver, false for submission fee
+     */
+    function grantFeeWaiver(address disclosure, bool isEligibilityWaiver) external onlyOwner {
+        if (isEligibilityWaiver) {
+            hasEligibilityFeeWaiver[disclosure] = true;
+        } else {
+            hasSubmissionFeeWaiver[disclosure] = true;
+        }
+        emit FeeWaiverGranted(disclosure, isEligibilityWaiver);
+    }
+
+    /**
+     * @notice Submits an eligible case for arbitration
      * @param disclosure Address of the disclosure contract
      */
-    function fileCase(address disclosure) external nonReentrant {
+    function submitCase(address disclosure) external nonReentrant {
         Case storage caseData = cases[disclosure];
-        if (!caseData.feePaid) revert NotEligible();
-        if (caseData.state != CaseState.None) revert InvalidCaseState();
-        if (block.timestamp < caseData.filingTime + COOLING_PERIOD) {
-            revert CoolingPeriodActive();
+        if (caseData.state != CaseState.Eligible) revert NotYetEligible();
+        
+        // Handle submission fee unless waived
+        if (!hasSubmissionFeeWaiver[disclosure]) {
+            uint256 fee = calculateCurrentFee();
+            bool success = trustlessRep.transferFrom(msg.sender, treasury, fee);
+            if (!success) revert TransferFailed();
+            caseData.submissionFeePaid = true;
         }
-        
-        bool success = trustlessRep.transferFrom(
-            msg.sender,
-            address(this),
-            CASE_FILING_FEE
-        );
-        if (!success) revert TransferFailed();
-        
-        caseData.state = CaseState.Pending;
+
+        // Add to review queue
+        uint256 position = queueInfo.nextPosition++;
+        reviewQueue[position] = disclosure;
+        queueInfo.pendingReviewCount++;
+
+        caseData.state = CaseState.PendingReview;
         caseData.filingTime = block.timestamp;
         caseData.filer = msg.sender;
-        
-        emit CaseFiled(disclosure, msg.sender);
+        caseData.queuePosition = position;
+
+        emit CaseSubmitted(disclosure, msg.sender);
     }
-    
+
     /**
-     * @notice Allows owner (single arbiter) to make decision on case
+     * @notice Reviews a case and decides whether to accept for trial
      * @param disclosure Address of the disclosure contract
-     * @param accepted Whether the case is accepted or declined
+     * @param acceptForTrial Whether to accept the case for trial
      */
-    function arbiterDecision(address disclosure, bool accepted) 
+    function reviewCase(address disclosure, bool acceptForTrial) 
         external 
         onlyOwner 
     {
         Case storage caseData = cases[disclosure];
-        if (caseData.state != CaseState.Pending) revert InvalidCaseState();
-        
-        if (accepted) {
-            bool success = trustlessRep.transfer(treasury, CASE_FILING_FEE);
-            if (!success) revert TransferFailed();
-            caseData.state = CaseState.Accepted;
-            emit CaseAccepted(disclosure);
+        if (caseData.state != CaseState.PendingReview) revert InvalidCaseState();
+
+        if (acceptForTrial) {
+            caseData.state = CaseState.AwaitingTrial;
+            trialQueue[queueInfo.awaitingTrialCount++] = disclosure;
+            emit CaseAcceptedForTrial(disclosure);
         } else {
-            bool success = trustlessRep.transfer(caseData.filer, CASE_FILING_FEE);
-            if (!success) revert TransferFailed();
             caseData.state = CaseState.Declined;
             emit CaseDeclined(disclosure);
         }
+
+        // Remove from review queue
+        _reorganizeQueue(caseData.queuePosition);
+        queueInfo.pendingReviewCount--;
     }
 
     /**
-     * @notice Reserved function for future upgrade to multi-arbiter system
-     * @dev Will be implemented in future upgrade
+     * @notice Makes final verdict on a case
+     * @param disclosure Address of the disclosure contract
+     * @param accepted Whether the case is accepted or rejected
      */
-    function upgradeToMultiArbiter() external onlyOwner {
-        // To be implemented in future upgrade
-        emit MultiArbiterEnabled();
+    function makeVerdict(address disclosure, bool accepted)
+        external
+        onlyOwner
+    {
+        Case storage caseData = cases[disclosure];
+        if (caseData.state != CaseState.AwaitingTrial) revert InvalidCaseState();
+
+        caseData.state = accepted ? CaseState.Accepted : CaseState.Rejected;
+        queueInfo.awaitingTrialCount--;
+
+        emit CaseVerdict(disclosure, accepted);
     }
 
     /**
-     * @notice Allows future upgrade path to new arbiter system
-     * @param newSystem Address of new arbiter system
-     * @dev Will be implemented in future upgrade
+     * @notice Internal function to reorganize queue after removal
+     * @param position Position to remove from queue
      */
-    function upgradeArbiterSystem(address newSystem) external onlyOwner {
-        // To be implemented in future upgrade
-        emit ArbiterSystemUpgraded(newSystem);
+    function _reorganizeQueue(uint256 position) internal {
+        for (uint256 i = position; i < queueInfo.nextPosition - 1; i++) {
+            reviewQueue[i] = reviewQueue[i + 1];
+            if (reviewQueue[i] != address(0)) {
+                cases[reviewQueue[i]].queuePosition = i;
+            }
+        }
+        delete reviewQueue[queueInfo.nextPosition - 1];
+        queueInfo.nextPosition--;
+        
+        emit QueueReorganized(position);
+    }
+
+    /**
+     * @notice Returns full case details including queue position
+     * @param disclosure Address of the disclosure contract
+     * @return state Current case state
+     * @return filingTime Time case was filed
+     * @return filer Address that filed the case
+     * @return queuePosition Current position in queue (if applicable)
+     * @return eligibilityFeePaid Whether eligibility fee was paid
+     * @return submissionFeePaid Whether submission fee was paid
+     */
+    function getCaseDetails(address disclosure) 
+        external 
+        view 
+        returns (
+            CaseState state,
+            uint256 filingTime,
+            address filer,
+            uint256 queuePosition,
+            bool eligibilityFeePaid,
+            bool submissionFeePaid
+        ) 
+    {
+        Case storage caseData = cases[disclosure];
+        return (
+            caseData.state,
+            caseData.filingTime,
+            caseData.filer,
+            caseData.queuePosition,
+            caseData.eligibilityFeePaid,
+            caseData.submissionFeePaid
+        );
     }
 }
